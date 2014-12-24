@@ -61,11 +61,23 @@ func (mr *MapReduce) RunJob(workerAddress string, jobType JobType) {
     } else if (jobType == "Reduce") {
         args = &DoJobArgs{mr.file, jobType, mr.nReduceScheduled-1, mr.nMap}
     }
-    DPrintf("Calling worker %s with job jobType: %s", workerAddress, jobType)
+    DPrintf("Calling worker %s with job jobType: %s\n", workerAddress, jobType)
     var reply DoJobReply
-    call(workerAddress, "Worker.DoJob", args, &reply)
-    DPrintf("Finished calling worker\n")
-    mr.RegisterNewWorker(workerAddress)
+    ok := call(workerAddress, "Worker.DoJob", args, &reply)
+    if !ok {
+        // The job failed. Handle this by reversing the state
+        DPrintf("The job type: %s failed\n", jobType)
+        if jobType == "Map" {
+            mr.nMapScheduled--
+        } else {
+            mr.nReduceScheduled--
+        }
+        // also remove the worker from the list of workers
+        delete(mr.Workers, workerAddress)
+    } else {
+        DPrintf("Finished calling worker\n")
+        mr.RegisterNewWorker(workerAddress)
+    }
 }
 
 func (mr* MapReduce) ScheduleNextPendingJob(workerAddress string) {
