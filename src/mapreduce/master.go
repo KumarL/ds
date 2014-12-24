@@ -27,11 +27,16 @@ func (mr *MapReduce) KillWorkers() *list.List {
 }
 
 func (mr *MapReduce) JobNameToSchedule() JobType {
-    mr.nMapScheduled++
+    DPrintf("mr.nMapScheduled = %d\tmr.nReduceScheduled = %d\n", mr.nMapScheduled, mr.nReduceScheduled)
     if mr.nMapScheduled < mr.nMap {
+        mr.nMapScheduled++
         DPrintf("Scheduling map: %d\n", mr.nMapScheduled)
         return "Map"
-    } else {
+    } else if mr.nReduceScheduled < mr.nReduce {
+        mr.nReduceScheduled++
+        DPrintf("Scheduling reduce: %d\n", mr.nReduceScheduled)
+        return "Reduce"
+    } else  {
         DPrintf("Returning empty string as job type\n")
         return "" 
     }
@@ -47,6 +52,20 @@ func (mr *MapReduce) RegisterNewWorker(workerAddress string) {
         mr.newWorkerAvailable <- workerAddress
     }()
     DPrintf("Exiting RegisterNewWorker\n")
+}
+
+func (mr *MapReduce) RunJob(workerAddress string, jobType JobType) {
+    var args *DoJobArgs
+    if (jobType == "Map") {
+        args = &DoJobArgs{mr.file, jobType, mr.nMapScheduled-1, mr.nReduce}
+    } else if (jobType == "Reduce") {
+        args = &DoJobArgs{mr.file, jobType, mr.nReduceScheduled-1, mr.nMap}
+    }
+    DPrintf("Calling worker %s with job jobType: %s", workerAddress, jobType)
+    var reply DoJobReply
+    call(workerAddress, "Worker.DoJob", args, &reply)
+    DPrintf("Finished calling worker\n")
+    mr.RegisterNewWorker(workerAddress)
 }
 
 func (mr* MapReduce) ScheduleNextPendingJob(workerAddress string) {
@@ -65,15 +84,7 @@ func (mr* MapReduce) ScheduleNextPendingJob(workerAddress string) {
             mr.AnnounceFinished <- true
         }()
     } else {
-        args := &DoJobArgs{mr.file, job, mr.nMapScheduled, mr.nReduce}
-        var jobReply DoJobReply
-        DPrintf("Calling worker\n")
-        call(workerAddress, "Worker.DoJob", args, &jobReply)
-        DPrintf("Finished calling worker\n")
-    
-        // the job finished executing.
-        // send a signal that this job is available for execution again
-        mr.RegisterNewWorker(workerAddress)
+        mr.RunJob(workerAddress, job)
     }
 } 
     
