@@ -17,6 +17,7 @@ type ViewServer struct {
 
 
   // Your declarations here.
+  now View
 }
 
 //
