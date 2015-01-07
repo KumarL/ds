@@ -17,7 +17,36 @@ type ViewServer struct {
 
 
   // Your declarations here.
-  now View
+  now *View
+  pending_ack *View
+  ticksPrimaryCount uint
+  ticksBackupCount uint
+}
+
+func IsViewEmpty(v *View) bool {
+  return v.Viewnum == 0
+}
+
+func SetPrimary(primaryName string, v *View) {
+    v.Viewnum++
+    v.Primary = primaryName
+}
+
+func SetBackup(backupName string, v *View) {
+    v.Viewnum++
+    v.Backup = backupName
+}
+
+func ZeroView(v *View) {
+    v.Viewnum = 0
+    v.Primary = ""
+    v.Backup = ""
+}
+
+func CopyView(to *View, from *View) {
+    to.Viewnum = from.Viewnum
+    to.Primary = from.Primary
+    to.Backup = from.Backup
 }
 
 //
@@ -26,7 +55,46 @@ type ViewServer struct {
 func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 
   // Your code here.
+  var returnView *View
+  fmt.Printf("Received ping from server:%s with viewnum: %d\n", args.Me, args.Viewnum)
 
+  if (IsViewEmpty(vs.now)) {
+    fmt.Printf("This is an empty view server currently.\n")
+    if (IsViewEmpty(vs.pending_ack)) {
+        fmt.Printf("The pending ack view is empty too.\n")
+        SetPrimary(args.Me, vs.pending_ack)
+        returnView = vs.pending_ack
+    } else if (vs.pending_ack.Primary == args.Me) {
+        fmt.Printf("Promote the pending_ack to primary\n")
+        CopyView(vs.now, vs.pending_ack)
+        ZeroView(vs.pending_ack)
+        returnView = vs.now
+    } else {
+        fmt.Printf("Can't accept more pings till the primary server responds\n")
+        returnView = vs.now
+    }
+  } else {
+    // We already have a view.
+    // Is this primary pinging us?
+    if (args.Me == vs.now.Primary) {
+        vs.ticksPrimaryCount = 0
+        returnView = vs.now
+    } else if (args.Me == vs.now.Backup) {
+        vs.ticksBackupCount = 0
+        returnView = vs.now
+    } else {
+        // Let's see what we can do now
+        if (vs.now.Backup == "") {
+            // We can use this client as backup server
+            vs.now.Viewnum++
+            vs.now.Backup = args.Me
+            returnView = vs.now
+        }
+    }
+  }
+
+  reply.View = *returnView
+  fmt.Printf("Returning viewnum: %d, Primary: %s, Backup: %s\n", reply.View.Viewnum, reply.View.Primary, reply.View.Backup)
   return nil
 }
 
@@ -36,6 +104,11 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 func (vs *ViewServer) Get(args *GetArgs, reply *GetReply) error {
 
   // Your code here.
+  if (vs.pending_ack.Viewnum > vs.now.Viewnum) {
+    reply.View = *vs.pending_ack
+  } else {
+    reply.View = *vs.now
+  }
 
   return nil
 }
@@ -49,6 +122,15 @@ func (vs *ViewServer) Get(args *GetArgs, reply *GetReply) error {
 func (vs *ViewServer) tick() {
 
   // Your code here.
+  vs.ticksPrimaryCount++
+  vs.ticksBackupCount++
+  
+  if (vs.ticksPrimaryCount == DeadPings) {
+    fmt.Printf("The primary server has died\n")
+    vs.now.Viewnum++
+    vs.now.Primary = vs.now.Backup
+    vs.now.Backup = "" 
+  }
 }
 
 //
@@ -61,10 +143,20 @@ func (vs *ViewServer) Kill() {
   vs.l.Close()
 }
 
+func MakeDefaultView() *View {
+  v := new(View)
+  v.Viewnum = 0
+  v.Primary = ""
+  v.Backup = ""
+  return v
+}
+
 func StartServer(me string) *ViewServer {
   vs := new(ViewServer)
   vs.me = me
   // Your vs.* initializations here.
+  vs.now = MakeDefaultView()
+  vs.pending_ack = MakeDefaultView()
 
   // tell net/rpc about our RPC server and handlers.
   rpcs := rpc.NewServer()
