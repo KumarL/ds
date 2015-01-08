@@ -21,6 +21,7 @@ type ViewServer struct {
   pending_ack *View
   ticksPrimaryCount uint
   ticksBackupCount uint
+  ticksIdleServerCount map[string]uint
 }
 
 func IsViewEmpty(v *View) bool {
@@ -77,8 +78,15 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
     // We already have a view.
     // Is this primary pinging us?
     if (args.Me == vs.now.Primary) {
-        vs.ticksPrimaryCount = 0
-        returnView = vs.now
+        // Is all well with Primary?
+        if (args.Viewnum == vs.now.Viewnum) {
+            vs.ticksPrimaryCount = 0
+            returnView = vs.now
+        } else {
+            fmt.Printf("Primary sent us a distress signal. It probably crashed and restarted\n")
+            //vs.DropPrimaryAndPromoteBackup()        
+            returnView = vs.now
+        }
     } else if (args.Me == vs.now.Backup) {
         vs.ticksBackupCount = 0
         returnView = vs.now
@@ -88,6 +96,10 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
             // We can use this client as backup server
             vs.now.Viewnum++
             vs.now.Backup = args.Me
+            returnView = vs.now
+        } else {
+            // add it to the list of idle servers
+            vs.ticksIdleServerCount[args.Me] = 0
             returnView = vs.now
         }
     }
@@ -113,6 +125,30 @@ func (vs *ViewServer) Get(args *GetArgs, reply *GetReply) error {
   return nil
 }
 
+func (vs *ViewServer) GetLiveIdleServer() string {
+  returnVal := ""
+  for key, value := range vs.ticksIdleServerCount {
+   if (value < DeadPings) {
+     returnVal = key
+   }
+  }
+  return returnVal
+}
+
+func (vs *ViewServer) ReplaceBackupWithIdleServer() {
+    possibleIdleServer := vs.GetLiveIdleServer()
+    if (possibleIdleServer != "") {
+        fmt.Printf("Found an idle server to replace backup: %s\n", possibleIdleServer)
+        delete(vs.ticksIdleServerCount, possibleIdleServer)
+    }
+    vs.now.Backup = possibleIdleServer
+}
+
+func (vs *ViewServer) DropPrimaryAndPromoteBackup() {
+    vs.now.Viewnum++
+    vs.now.Primary = vs.now.Backup
+    vs.ReplaceBackupWithIdleServer()
+}
 
 //
 // tick() is called once per PingInterval; it should notice
@@ -127,9 +163,10 @@ func (vs *ViewServer) tick() {
   
   if (vs.ticksPrimaryCount == DeadPings) {
     fmt.Printf("The primary server has died\n")
-    vs.now.Viewnum++
-    vs.now.Primary = vs.now.Backup
-    vs.now.Backup = "" 
+    vs.DropPrimaryAndPromoteBackup()
+  } else if (vs.ticksBackupCount == DeadPings) {
+    fmt.Printf("The backup server has died.\n")
+    vs.ReplaceBackupWithIdleServer()
   }
 }
 
@@ -157,6 +194,7 @@ func StartServer(me string) *ViewServer {
   // Your vs.* initializations here.
   vs.now = MakeDefaultView()
   vs.pending_ack = MakeDefaultView()
+  vs.ticksIdleServerCount = make(map[string]uint)
 
   // tell net/rpc about our RPC server and handlers.
   rpcs := rpc.NewServer()
