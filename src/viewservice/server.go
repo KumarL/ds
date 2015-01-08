@@ -145,7 +145,6 @@ func (vs *ViewServer) ReplaceBackupWithIdleServer() {
 }
 
 func (vs *ViewServer) DropPrimaryAndPromoteBackup() {
-    vs.now.Viewnum++
     vs.now.Primary = vs.now.Backup
     vs.ReplaceBackupWithIdleServer()
 }
@@ -163,9 +162,11 @@ func (vs *ViewServer) tick() {
   
   if (vs.ticksPrimaryCount == DeadPings) {
     fmt.Printf("The primary server has died\n")
+    vs.now.Viewnum++
     vs.DropPrimaryAndPromoteBackup()
   } else if (vs.ticksBackupCount == DeadPings) {
     fmt.Printf("The backup server has died.\n")
+    vs.now.Viewnum++
     vs.ReplaceBackupWithIdleServer()
   }
 }
