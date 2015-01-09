@@ -19,6 +19,9 @@ type ViewServer struct {
   // Your declarations here.
   now *View
   pending_ack *View
+  pending_newprimary *View
+  fAwaitingNewPrimaryAck bool
+  fPrimaryAcked bool
   ticksPrimaryCount uint
   ticksBackupCount uint
   ticksIdleServerCount map[string]uint
@@ -61,45 +64,62 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 
   if (IsViewEmpty(vs.now)) {
     fmt.Printf("This is an empty view server currently.\n")
-    if (IsViewEmpty(vs.pending_ack)) {
-        fmt.Printf("The pending ack view is empty too.\n")
-        SetPrimary(args.Me, vs.pending_ack)
-        returnView = vs.pending_ack
-    } else if (vs.pending_ack.Primary == args.Me) {
-        fmt.Printf("Promote the pending_ack to primary\n")
-        CopyView(vs.now, vs.pending_ack)
-        ZeroView(vs.pending_ack)
-        returnView = vs.now
-    } else {
-        fmt.Printf("Can't accept more pings till the primary server responds\n")
-        returnView = vs.now
-    }
+    vs.now.Viewnum++
+    vs.now.Primary = args.Me
+    vs.fPrimaryAcked = false
+    returnView = vs.now
   } else {
     // We already have a view.
     // Is this primary pinging us?
-    if (args.Me == vs.now.Primary) {
+
+    if (vs.fAwaitingNewPrimaryAck && vs.pending_newprimary.Primary == args.Me) {
+        // We want to promote backup to be the new primary now
+        if (vs.pending_newprimary.Viewnum - 1 == args.Viewnum) {
+            fmt.Printf("Received ping from server that we want to promote as primary\n")
+            returnView = vs.pending_newprimary
+        } else if (vs.pending_newprimary.Viewnum == args.Viewnum) {
+            fmt.Printf("Primary has accepted requested to be primary\n")
+            CopyView(vs.now, vs.pending_newprimary)
+            ZeroView(vs.pending_newprimary)
+            vs.fAwaitingNewPrimaryAck = false
+            returnView = vs.now
+        } else {
+            returnView = vs.now
+        }
+    } else if (args.Me == vs.now.Primary) {
         // Is all well with Primary?
         if (args.Viewnum == vs.now.Viewnum) {
             vs.ticksPrimaryCount = 0
+            vs.fPrimaryAcked = true
             returnView = vs.now
-        } else {
+        } else if (args.Viewnum + 1 == vs.now.Viewnum) {
+            fmt.Printf("Primary is behind a view. Send it the latest view\n")
+            returnView = vs.now
+        } else if (args.Viewnum == 0) {
             fmt.Printf("Primary sent us a distress signal. It probably crashed and restarted\n")
-            //vs.DropPrimaryAndPromoteBackup()        
+            vs.now.Viewnum++
+            vs.now.Primary = vs.now.Backup
+            vs.now.Backup = args.Me
+            vs.fPrimaryAcked = false
             returnView = vs.now
         }
     } else if (args.Me == vs.now.Backup) {
-        vs.ticksBackupCount = 0
-        returnView = vs.now
+           vs.ticksBackupCount = 0
+           returnView = vs.now
     } else {
         // Let's see what we can do now
         if (vs.now.Backup == "") {
             // We can use this client as backup server
             vs.now.Viewnum++
             vs.now.Backup = args.Me
+            vs.fPrimaryAcked = false
+            returnView = vs.now
+        } else if (vs.pending_newprimary.Primary != args.Me && vs.pending_newprimary.Backup != args.Me) {
+            // add it to the list of idle servers
+            fmt.Printf("Received tick from an idle server: %s\n", args.Me)
+            vs.ticksIdleServerCount[args.Me] = 0
             returnView = vs.now
         } else {
-            // add it to the list of idle servers
-            vs.ticksIdleServerCount[args.Me] = 0
             returnView = vs.now
         }
     }
@@ -116,11 +136,7 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 func (vs *ViewServer) Get(args *GetArgs, reply *GetReply) error {
 
   // Your code here.
-  if (vs.pending_ack.Viewnum > vs.now.Viewnum) {
-    reply.View = *vs.pending_ack
-  } else {
-    reply.View = *vs.now
-  }
+  reply.View = *vs.now
 
   return nil
 }
@@ -140,13 +156,34 @@ func (vs *ViewServer) ReplaceBackupWithIdleServer() {
     if (possibleIdleServer != "") {
         fmt.Printf("Found an idle server to replace backup: %s\n", possibleIdleServer)
         delete(vs.ticksIdleServerCount, possibleIdleServer)
+        vs.fPrimaryAcked = false
     }
     vs.now.Backup = possibleIdleServer
 }
 
 func (vs *ViewServer) DropPrimaryAndPromoteBackup() {
-    vs.now.Primary = vs.now.Backup
-    vs.ReplaceBackupWithIdleServer()
+    possibleIdleServer := vs.GetLiveIdleServer()
+/*
+    if (possibleIdleServer != "") {
+        vs.pending_newprimary.Primary = vs.now.Backup
+        fmt.Printf("Found an idle server to replace backup: %s\n", possibleIdleServer)
+        delete(vs.ticksIdleServerCount, possibleIdleServer)
+        vs.pending_newprimary.Backup = possibleIdleServer
+        vs.pending_newprimary.Viewnum = vs.now.Viewnum
+        vs.pending_newprimary.Viewnum++
+        fmt.Printf("Awaiting ack of new view: %d\n", vs.pending_newprimary.Viewnum)
+        vs.fAwaitingNewPrimaryAck = true
+*/
+    if (vs.fPrimaryAcked) {
+        fmt.Printf("Moving the view ahead since Primary had acknowledged\n")
+        vs.now.Viewnum++
+        vs.now.Primary = vs.now.Backup
+        vs.now.Backup = possibleIdleServer
+        if (possibleIdleServer != "") {
+            delete(vs.ticksIdleServerCount, possibleIdleServer)
+        }
+        vs.fPrimaryAcked = false
+    }
 }
 
 //
@@ -162,7 +199,6 @@ func (vs *ViewServer) tick() {
   
   if (vs.ticksPrimaryCount == DeadPings) {
     fmt.Printf("The primary server has died\n")
-    vs.now.Viewnum++
     vs.DropPrimaryAndPromoteBackup()
   } else if (vs.ticksBackupCount == DeadPings) {
     fmt.Printf("The backup server has died.\n")
@@ -195,6 +231,8 @@ func StartServer(me string) *ViewServer {
   // Your vs.* initializations here.
   vs.now = MakeDefaultView()
   vs.pending_ack = MakeDefaultView()
+  vs.pending_newprimary = MakeDefaultView()
+  vs.fAwaitingNewPrimaryAck = false
   vs.ticksIdleServerCount = make(map[string]uint)
 
   // tell net/rpc about our RPC server and handlers.
