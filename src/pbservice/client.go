@@ -5,15 +5,15 @@ import "net/rpc"
 import "fmt"
 
 // You'll probably need to uncomment these:
-// import "time"
-// import "crypto/rand"
-// import "math/big"
-
-
+import "time"
+import "crypto/rand"
+import "math/big"
 
 type Clerk struct {
   vs *viewservice.Clerk
   // Your declarations here
+  view *viewservice.View
+  vshost string
 }
 
 
@@ -21,6 +21,8 @@ func MakeClerk(vshost string, me string) *Clerk {
   ck := new(Clerk)
   ck.vs = viewservice.MakeClerk(me, vshost)
   // Your ck.* initializations here
+  ck.view = viewservice.MakeDefaultView()
+  ck.vshost = vshost
 
   return ck
 }
@@ -68,9 +70,53 @@ func call(srv string, rpcname string,
 //
 func (ck *Clerk) Get(key string) string {
 
-  // Your code here.
+    // Your code here.
+    shouldAttempt := true
+    firstAttempt := true
+    uid := ck.GetUID()
 
-  return "???"
+    retval := ""
+    for shouldAttempt {
+        if !firstAttempt || ck.view.Viewnum == 0 {
+            ck.FindView()
+        }
+
+        args := GetArgs{}
+        args.Key = key
+        args.PrimaryCaller = false
+        args.UID_str = uid.String()
+
+        var reply GetReply
+
+        success := call(ck.view.Primary, "PBServer.Get", &args, &reply)
+        if success && (reply.Err == OK || reply.Err == ErrNoKey) {
+            retval = reply.Value
+            shouldAttempt = false
+        }
+
+        //fmt.Printf("Clerk's Get call received Err: %s\n", reply.Err)
+        firstAttempt = false
+        time.Sleep(viewservice.PingInterval)
+    }
+
+    return retval
+}
+
+func (ck *Clerk) FindView() {
+    args := viewservice.GetArgs{}
+
+    var reply viewservice.GetReply
+    ok := call(ck.vshost, "ViewServer.Get", &args, &reply)
+    if ok {
+        viewservice.CopyView(ck.view, &reply.View)
+    }
+}
+
+func (ck *Clerk) GetUID() *big.Int {
+    var n *big.Int
+    max := *big.NewInt(99999999999)
+    n, _ = rand.Int(rand.Reader, &max)
+    return n
 }
 
 //
@@ -80,7 +126,36 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutExt(key string, value string, dohash bool) string {
 
   // Your code here.
-  return "???"
+  shouldAttempt := true
+  firstAttempt := true
+  uid := ck.GetUID()
+
+  retval := ""
+  for shouldAttempt {
+        if !firstAttempt || ck.view.Viewnum == 0 {
+            ck.FindView()
+        }
+        
+        args := PutArgs{}
+        args.Key = key
+        args.Value = value
+        args.DoHash = dohash
+        args.PrimaryCaller = false
+        args.UID_str = uid.String()
+
+        var reply PutReply
+
+        success := call(ck.view.Primary, "PBServer.Put", &args, &reply)
+        if success && reply.Err == OK {
+            retval = reply.PreviousValue
+            shouldAttempt = false
+        }
+        //fmt.Printf("Clerk's Put call received Err: %s\n", reply.Err)
+        firstAttempt = false
+        time.Sleep(viewservice.PingInterval)
+  }
+
+  return retval
 }
 
 func (ck *Clerk) Put(key string, value string) {
