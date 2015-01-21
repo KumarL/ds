@@ -92,8 +92,8 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
             vs.ticksPrimaryCount = 0
             vs.fPrimaryAcked = true
             returnView = vs.now
-        } else if (args.Viewnum + 1 == vs.now.Viewnum) {
-            fmt.Printf("Primary is behind a view. Send it the latest view\n")
+        } else if (args.Viewnum < vs.now.Viewnum) {
+            fmt.Printf("Primary is behind %d view. Send it the latest view\n", vs.now.Viewnum - args.Viewnum)
             returnView = vs.now
         } else if (args.Viewnum == 0) {
             fmt.Printf("Primary sent us a distress signal. It probably crashed and restarted\n")
@@ -123,6 +123,10 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
             returnView = vs.now
         }
     }
+  }
+
+  if returnView == nil {
+    fmt.Printf("Nothing to pass to server. Going to crash\n")
   }
 
   reply.View = *returnView

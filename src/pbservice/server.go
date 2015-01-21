@@ -15,7 +15,7 @@ import "errors"
 import "strconv"
 
 // Debugging
-const Debug = 0
+const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
   if Debug > 0 {
@@ -42,9 +42,37 @@ type PBServer struct {
   view *viewservice.View
   vsserver string
   kvstore map[string]string
+  kvstoreLock sync.RWMutex
   fIsPrimary bool
   fIsBackup bool
   oldUIDs map[string]OpReply
+  oldUIDsLock sync.RWMutex
+}
+
+func (pb *PBServer) PutKVStore(key string, value string) {
+    pb.kvstoreLock.Lock()
+    defer pb.kvstoreLock.Unlock()
+    pb.kvstore[key] = value
+} 
+
+func (pb *PBServer) GetKVStore(key string) (string, bool) {
+    pb.kvstoreLock.RLock()
+    defer pb.kvstoreLock.RUnlock()
+    value, err := pb.kvstore[key]
+    return value, err
+}
+
+func (pb *PBServer) PutUIDsStore(key string, value OpReply) {
+    pb.oldUIDsLock.Lock()
+    defer pb.oldUIDsLock.Unlock()
+    pb.oldUIDs[key] = value
+}
+
+func (pb *PBServer) GetUIDStore(key string) (OpReply, bool) {
+    pb.oldUIDsLock.RLock()
+    defer pb.oldUIDsLock.RUnlock()
+    op, err := pb.oldUIDs[key]
+    return op, err
 }
 
 func (pb *PBServer) PutInt(args *PutArgs) (string, Err) {
@@ -54,27 +82,27 @@ func (pb *PBServer) PutInt(args *PutArgs) (string, Err) {
             previousvalue = ""
         }
         hash_args := previousvalue + args.Value
-        fmt.Printf("Computing hash value of %s\n", hash_args)
+        DPrintf("Computing hash value of %s\n", hash_args)
         hash_val := hash(hash_args)
         hash_val_str := strconv.Itoa(int(hash_val))
-        fmt.Printf("Computed hash value: %s\n", hash_val_str)
-        pb.kvstore[args.Key] = hash_val_str
+        DPrintf("Computed hash value: %s\n", hash_val_str)
+        pb.PutKVStore(args.Key, hash_val_str)
         return previousvalue, OK
     } else {
-        pb.kvstore[args.Key] = args.Value
+        pb.PutKVStore(args.Key, args.Value)
         return "", OK
     }
 }
 
 func (pb *PBServer) UIDExists(uid_str string) bool {
-    _, ok := pb.oldUIDs[uid_str]
+    _, ok := pb.GetUIDStore(uid_str)
     return ok
 }
 
 func (pb *PBServer) Put(args *PutArgs, reply *PutReply) error {
-    fmt.Printf("Server:%s received Put of: key = %s\tvalue = %s\n", pb.me, args.Key, args.Value)
+    DPrintf("Server:%s received Put of: key = %s\tvalue = %s\n", pb.me, args.Key, args.Value)
     if pb.UIDExists(args.UID_str) {
-        //fmt.Printf("Server: %s, Put operation. Received duplicate: %s. Bailing out\n", pb.me, args.UID_str)
+        //DPrintf("Server: %s, Put operation. Received duplicate: %s. Bailing out\n", pb.me, args.UID_str)
         reply.Err = pb.oldUIDs[args.UID_str].err
         reply.PreviousValue = pb.oldUIDs[args.UID_str].previousValue
         return nil
@@ -90,7 +118,7 @@ func (pb *PBServer) Put(args *PutArgs, reply *PutReply) error {
                 ok := call(pb.view.Backup, "PBServer.Put", &args_fwd, reply)
                 if ok {
                     if reply.Err == ErrWrongServer {
-                        fmt.Printf("Received ErrWrongServer from the backup\n")
+                        DPrintf("Received ErrWrongServer from the backup\n")
                         return nil
                     } else {
                         reply.PreviousValue, reply.Err = pb.PutInt(args)
@@ -109,13 +137,15 @@ func (pb *PBServer) Put(args *PutArgs, reply *PutReply) error {
         } else {
             reply.Err = ErrWrongServer
         }
+    } else {
+        reply.Err = ErrWrongServer
     }
 
     if reply.Err == OK {
         op_reply := OpReply{}
         op_reply.err = reply.Err
         op_reply.previousValue = reply.PreviousValue
-        pb.oldUIDs[args.UID_str] = op_reply
+        pb.PutUIDsStore(args.UID_str, op_reply)
     }
 
     return nil
@@ -124,7 +154,7 @@ func (pb *PBServer) Put(args *PutArgs, reply *PutReply) error {
 func (pb *PBServer) GetInt(key string) (string, Err) {
     var err Err 
     err = OK
-    value, ok := pb.kvstore[key]
+    value, ok := pb.GetKVStore(key)
     if !ok {
         err = ErrNoKey
     }
@@ -133,9 +163,9 @@ func (pb *PBServer) GetInt(key string) (string, Err) {
 
 func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
     // Your code here.
-    fmt.Printf("Server:%s received Get of: key = %s\n", pb.me, args.Key)
+    DPrintf("Server:%s received Get of: key = %s\n", pb.me, args.Key)
     if pb.UIDExists(args.UID_str) {
-        //fmt.Printf("Server: %s, Put operation. Received duplicate: %s. Bailing out\n", pb.me, args.UID_str)
+        //DPrintf("Server: %s, Put operation. Received duplicate: %s. Bailing out\n", pb.me, args.UID_str)
         reply.Err = pb.oldUIDs[args.UID_str].err
         reply.Value = pb.oldUIDs[args.UID_str].value
         return nil
@@ -152,8 +182,8 @@ func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
                 ok := call(pb.view.Backup, "PBServer.Get", args_fwd, reply)
                 if ok {
                     if reply.Err == ErrWrongServer {
-                        fmt.Printf("Received ErrWrongServer from the backup\n")
-                        return nil
+                        DPrintf("Received ErrWrongServer from the backup\n")
+                        return errors.New("Get: Received ErrWrongServer from the backup\n")
                     }
                 } else {
                     return errors.New("Get: Call to backup failed\n")
@@ -168,13 +198,15 @@ func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
         } else {
             reply.Err = ErrWrongServer
         }
+    } else {
+        reply.Err = ErrWrongServer
     }
 
     if reply.Err == OK || reply.Err == ErrNoKey {
         op_reply := OpReply{}
         op_reply.err = reply.Err
         op_reply.value = reply.Value
-        pb.oldUIDs[args.UID_str] = op_reply
+        pb.PutUIDsStore(args.UID_str, op_reply)
     }
 
     return nil
@@ -193,24 +225,27 @@ func (pb *PBServer) tick() {
     var reply viewservice.PingReply
     ok := call(pb.vsserver, "ViewServer.Ping", args, &reply)
     if ok {
-        fmt.Printf("Received view from the viewserver:%s\n", PrettyPrintView(&reply.View))
+        DPrintf("Received view from the viewserver:%s\n", PrettyPrintView(&reply.View))
         // Check for the case when the server is already aware of being Primar,
         // a new Backup has been added
-        fViewHasNewBackup := pb.fIsPrimary && (pb.view.Backup != reply.View.Backup) && (reply.View.Backup != "")
-        viewservice.CopyView(pb.view, &reply.View) 
+        fViewHasNewBackup := pb.fIsPrimary && (reply.View.Primary == pb.me) && (pb.view.Backup != reply.View.Backup) && (reply.View.Backup != "")
 
         if fViewHasNewBackup {
-            go func() {
-                transfer_args := TransferArgs{}
-                transfer_args.KeyValueStore = pb.kvstore
-                var transfer_reply TransferReply
-                call(pb.view.Backup, "PBServer.TransferBulk", &transfer_args, &transfer_reply)
-                fmt.Printf("Finished calling TransferBulk\n")
-            }()
-        } 
-
-        pb.fIsPrimary = (pb.view.Primary == pb.me)
-        pb.fIsBackup = (pb.view.Backup == pb.me)
+            transfer_args := TransferArgs{}
+            transfer_args.KeyValueStore = pb.kvstore
+            var transfer_reply TransferReply
+            transfer_ok := call(reply.View.Backup, "PBServer.TransferBulk", &transfer_args, &transfer_reply)
+            fmt.Printf("Finished calling TransferBulk with: %d\n", transfer_ok)
+            if transfer_ok {
+                viewservice.CopyView(pb.view, &reply.View) 
+                pb.fIsPrimary = (pb.view.Primary == pb.me)
+                pb.fIsBackup = (pb.view.Backup == pb.me)
+            }
+        } else { 
+            viewservice.CopyView(pb.view, &reply.View) 
+            pb.fIsPrimary = (pb.view.Primary == pb.me)
+            pb.fIsBackup = (pb.view.Backup == pb.me)
+        }
     }
 }
 
@@ -223,10 +258,10 @@ func (pb *PBServer) kill() {
 }
 
 func (pb *PBServer) TransferBulk(args *TransferArgs, reply *TransferReply) error {
-    fmt.Printf("Received a transfer bulk of %d kv-pairs\n", len(args.KeyValueStore))
+    DPrintf("Received a transfer bulk of %d kv-pairs\n", len(args.KeyValueStore))
     for key, value := range args.KeyValueStore {
-        fmt.Printf("TransferBulk: %s\t%s\n", key, value)
-        pb.kvstore[key] = value
+        DPrintf("TransferBulk: %s\t%s\n", key, value)
+        pb.PutKVStore(key, value)
     }
 
     reply.Err = "OK"
@@ -271,7 +306,7 @@ func StartServer(vshost string, me string) *PBServer {
           f, _ := c1.File()
           err := syscall.Shutdown(int(f.Fd()), syscall.SHUT_WR)
           if err != nil {
-            fmt.Printf("shutdown: %v\n", err)
+            DPrintf("shutdown: %v\n", err)
           }
           pb.done.Add(1)
           go func() {
@@ -289,7 +324,7 @@ func StartServer(vshost string, me string) *PBServer {
         conn.Close()
       }
       if err != nil && pb.dead == false {
-        fmt.Printf("PBServer(%v) accept: %v\n", me, err.Error())
+        DPrintf("PBServer(%v) accept: %v\n", me, err.Error())
         pb.kill()
       }
     }
