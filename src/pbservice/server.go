@@ -228,7 +228,7 @@ func (pb *PBServer) tick() {
         DPrintf("Received view from the viewserver:%s\n", PrettyPrintView(&reply.View))
         // Check for the case when the server is already aware of being Primar,
         // a new Backup has been added
-        fViewHasNewBackup := pb.fIsPrimary && (reply.View.Primary == pb.me) && (pb.view.Backup != reply.View.Backup) && (reply.View.Backup != "")
+        fViewHasNewBackup := (pb.view.Backup != reply.View.Backup) && (reply.View.Backup != "")
 
         if fViewHasNewBackup {
             transfer_args := TransferArgs{}
