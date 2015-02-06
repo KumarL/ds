@@ -30,7 +30,6 @@ import "fmt"
 import "math/rand"
 import "math"
 
-
 type Paxos struct {
   mu sync.Mutex
   l net.Listener
@@ -45,6 +44,7 @@ type Paxos struct {
   seqProposerStates map[int]PeerState
   seqAcceptorStates map[int]PeerState
   decidedStates map[int]DecidedState
+  acceptorStateLock sync.Mutex
 }
 
 type PeerState struct {
@@ -62,13 +62,14 @@ type PrepareReply struct {
     ignore bool
     s int // paxos instance sequence number
     n_a int // Acceptor's highest number that it has seen
-    v_a interface {} // Acceptor's accepted value
+    v_a interface{} // Acceptor's accepted value
 }
 
 type AcceptArg struct {
     s int // paxos instance sequence number
     n int // n_p
-    v interface {} // value from the highest recieved n_a
+    v interface{} // value from the highest recieved n_a
+    accepted bool
 }
 
 type AcceptReply struct {
@@ -79,7 +80,7 @@ type AcceptReply struct {
 type DecidedArg struct {
     s int
     n int
-    v inteface{}
+    v interface{}
 }
 
 type DecidedReply struct {
@@ -90,6 +91,16 @@ type DecidedState struct {
     decided bool
     v interface{}
 }    
+
+// Debugging
+const Debug = 1
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+  if Debug > 0 {
+    n, err = fmt.Printf(format, a...)
+  }
+  return
+}
 
 //
 // call() sends an RPC to the rpcname handler on server srv
@@ -128,10 +139,10 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 }
 
 func (px *Paxos) IsMajority(n int) bool {
-    return n >= (math.Floor(n/2) + 1)
+    return n >= (n/2 + 1)
 }
 
-func (px *Paxos) Prepare(seq int, n_p int) (bool, int, inteface{}) {
+func (px *Paxos) Prepare(seq int, n_p int) (bool, int, interface{}) {
     result := false
     n_a := math.MinInt32
     var v_a interface{}
@@ -146,7 +157,8 @@ func (px *Paxos) Prepare(seq int, n_p int) (bool, int, inteface{}) {
     var mutex  = &sync.Mutex{}
 
     var wg sync.WaitGroup
-    for server := range px.peers {
+    for idx := range px.peers {
+        server := px.peers[idx]
         wg.Add(1)
         go func() {
             ok := call(server, "Paxos.PrepareHandler", &arg, &reply)
@@ -174,14 +186,14 @@ func (px *Paxos) Prepare(seq int, n_p int) (bool, int, inteface{}) {
     return result, n_a, v_a
 }
 
-func (px *Paxos) UpdateAcceptorState(state *PeerState) {
-    acceptorStateLock.Lock()
-    px.seqAcceptorStates[arg.s] = *acceptorState
-    acceptorStateLock.Unlock()
+func (px *Paxos) UpdateAcceptorState(seq int, state *PeerState) {
+    px.acceptorStateLock.Lock()
+    px.seqAcceptorStates[seq] = *state
+    px.acceptorStateLock.Unlock()
 }
 
 func (px *Paxos) PrepareHandler(arg *PrepareArg, reply *PrepareReply) {
-    acceptorState, ok = px.seqAcceptorStates[arg.s]
+    acceptorState, ok := px.seqAcceptorStates[arg.s]
     reply.ignore = true
 
     if ok {
@@ -189,18 +201,18 @@ func (px *Paxos) PrepareHandler(arg *PrepareArg, reply *PrepareReply) {
         if arg.n > acceptorState.n_p {
             // update the local state
             acceptorState.n_p = arg.n
-            UpdateAcceptorState(&acceptorState)
+            px.UpdateAcceptorState(arg.s, &acceptorState)
 
             reply.ignore = false
             reply.s = arg.s
-            reply.n_a = arg.peerState.n_a
-            reply.v_a = arg.peerState.v_a
+            reply.n_a = acceptorState.n_a
+            reply.v_a = acceptorState.v_a
         }
     } else {
-        acceptorState = px.PeerState{}
+        acceptorState := PeerState{}
         acceptorState.n_p = arg.n
         acceptorState.n_a = -1
-        UpdateAcceptorState(&acceptorState)
+        px.UpdateAcceptorState(arg.s, &acceptorState)
 
         reply.ignore = false
         reply.s = arg.s
@@ -209,8 +221,6 @@ func (px *Paxos) PrepareHandler(arg *PrepareArg, reply *PrepareReply) {
 }
 
 func (px *Paxos) Accept(seq int, n int, v interface{}) bool {
-    result := false
-
     arg := AcceptArg{}
     arg.s = seq
     arg.n = n
@@ -218,10 +228,12 @@ func (px *Paxos) Accept(seq int, n int, v interface{}) bool {
 
     var reply AcceptReply
 
-    var mutex = &sync.Mutex{}
+    num_responses_received := 0
+    mutex := &sync.Mutex{}
 
     var wg sync.WaitGroup
-    for server := range px.peers {
+    for idx := range px.peers {
+        server := px.peers[idx]
         wg.Add(1)
         go func() {
             ok := call(server, "Paxos.AcceptHandler", &arg, &reply)
@@ -234,7 +246,7 @@ func (px *Paxos) Accept(seq int, n int, v interface{}) bool {
     }
     wg.Wait()
 
-    return paxos.IsMajority(num_responses_received)
+    return px.IsMajority(num_responses_received)
 }
 
 func (px *Paxos) AcceptHandler(arg *AcceptArg, reply *AcceptReply) {
@@ -243,15 +255,15 @@ func (px *Paxos) AcceptHandler(arg *AcceptArg, reply *AcceptReply) {
     acceptorState, ok := px.seqAcceptorStates[arg.s]
 
     if !ok {
-        acceptorState = &px.PeerState{}
+        acceptorState := &PeerState{}
         acceptorState.n_p = -1
     }
 
     if arg.n >= acceptorState.n_p {
         acceptorState.n_p = arg.n
         acceptorState.n_a = arg.n
-        acceptorState.v = arg.v
-        UpdateAcceptorState(&acceptorState)
+        acceptorState.v_a = arg.v
+        px.UpdateAcceptorState(arg.s, &acceptorState)
         reply.accepted = true
     }
 }
@@ -262,10 +274,11 @@ func (px *Paxos) Decided(seq int, n int, v interface{}) bool {
     decided.n = n
     decided.v = v
 
-    for server := range px.peers {
+    for idx := range px.peers {
+        server := px.peers[idx]
         go func() {
             var reply DecidedReply
-            ok := call(server, "Paxos.DecidedHandler", &decided, &reply)
+            call(server, "Paxos.DecidedHandler", &decided, &reply)
         }()
     }
     return true
@@ -289,9 +302,14 @@ func (px *Paxos) Start(seq int, v interface{}) {
         }
 
         result := false
+        n_a := -1
+        var v_a interface{}
+
         for !result {
-            result, n_a, v_a := px.Prepare(seq, proposerState.n_p)
+            result, n_a, v_a = px.Prepare(seq, proposerState.n_p)
         }
+
+        DPrintf("[%s] Results received from Start: result=[%d], n_a=[%d], v_a=[%d]", result, n_a, v_a)
 
         // The proposal has been accepted
         accepted := px.Accept(seq, n_a, v_a)
@@ -308,7 +326,7 @@ func (px *Paxos) Start(seq int, v interface{}) {
 // see the comments for Min() for more explanation.
 //
 func (px *Paxos) Done(seq int) {
-    delete(px.DecidedState, seq)
+    delete(px.decidedStates, seq)
 }
 
 //
@@ -319,7 +337,7 @@ func (px *Paxos) Done(seq int) {
 func (px *Paxos) Max() int {
     // Your code here.
     seq := -1
-    for decided_seq := range px.DecidedState {
+    for decided_seq := range px.decidedStates {
         if decided_seq > seq {
             seq = decided_seq
         }
@@ -358,7 +376,7 @@ func (px *Paxos) Max() int {
 func (px *Paxos) Min() int {
   // You code here.
     min_seq := math.MaxInt32
-    for seq := range px.DecidedState {
+    for seq := range px.decidedStates {
         if seq < min_seq {
             min_seq = seq
         }
@@ -375,10 +393,10 @@ func (px *Paxos) Min() int {
 //
 func (px *Paxos) Status(seq int) (bool, interface{}) {
     // Your code here.
-    decidedState, decided := px.DecidedState[seq]
-    v = nil
+    decidedState, decided := px.decidedStates[seq]
+    var v interface{}
 
-    if ok {
+    if decided {
         v = decidedState.v
     }
 
@@ -410,7 +428,7 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
   px.seqProposerStates = make(map[int]PeerState)
   px.seqAcceptorStates = make(map[int]PeerState)
   px.decidedStates = make(map[int]DecidedState)
-  px.acceptorStateLock = &sync.Mutex{}
+  px.acceptorStateLock = sync.Mutex{}
 
   // Your initialization code here.
 
