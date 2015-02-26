@@ -44,7 +44,12 @@ type Paxos struct {
   seqProposerStates map[int]PeerState
   seqAcceptorStates map[int]PeerState
   decidedStates map[int]DecidedState
-  acceptorStateLock sync.Mutex
+  prepareHandlerLock sync.Mutex
+  acceptHandlerLock sync.Mutex
+  proposerSet ProposerNumberFactory
+  doneAllPeers []int
+  minSeq int
+  maxSeq int
 }
 
 type PeerState struct {
@@ -63,6 +68,7 @@ type PrepareReply struct {
     S int // paxos instance sequence number
     N_A int // Acceptor's highest number that it has seen
     V_A interface{} // Acceptor's accepted value
+    doneValue int
 }
 
 type AcceptArg struct {
@@ -74,6 +80,7 @@ type AcceptArg struct {
 type AcceptReply struct {
     S int // paxos instance sequence number
     Accepted bool
+    doneValue int
 }
 
 type DecidedArg struct {
@@ -90,6 +97,12 @@ type DecidedState struct {
     Decided bool
     V interface{}
 }    
+
+type ProposerNumberFactory struct {
+    min int
+    max int
+    last int
+}
 
 const InitialN_A = -1
 
@@ -140,13 +153,13 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 }
 
 func (px *Paxos) IsMajority(n int) bool {
-    return n >= (n/2 + 1)
+    return n >= len(px.peers)/2 + 1
 }
 
-func (px *Paxos) Prepare(seq int, n_p int, self_value interface{}) (bool, int, interface{}) {
+func (px *Paxos) Prepare(seq int, n_p int, self_value interface{}) (bool, interface{}) {
     result := false
     n_a := math.MinInt32
-    var v_a interface{}
+    v_a := self_value
 
     arg := PrepareArg{}
     arg.S = seq
@@ -160,22 +173,32 @@ func (px *Paxos) Prepare(seq int, n_p int, self_value interface{}) (bool, int, i
     var wg sync.WaitGroup
     for idx := range px.peers {
         server := px.peers[idx]
+        isLocal := idx == px.me
         wg.Add(1)
         go func() {
             defer wg.Done()
-            ok := call(server, "Paxos.PrepareHandler", &arg, &reply)
-            DPrintf("[%s] PrepareHandler returned from server=[%s] with ok=[%d], Ignore=[%d], N_A=[%d], V_A=[%s]\n", px.peers[px.me], server, ok, reply.Ignore, reply.N_A, reply.V_A)
+            var ok bool
+            if isLocal {
+                err := px.PrepareHandler(&arg, &reply)
+                ok = err == nil
+            } else {
+                ok = call(server, "Paxos.PrepareHandler", &arg, &reply)
+            }
+
+            if ok {
+                go func () {
+                    px.HandleDoneUpdate(idx, reply.doneValue)
+                }()
+            }
+            
+            DPrintf("[%s] PrepareHandler returned from server=[%s] with ok=[%d], Ignore=[%d], seq=[%d], N_A=[%d], V_A=[%s]\n", px.peers[px.me], server, ok, reply.Ignore, seq, reply.N_A, reply.V_A)
             if ok && !reply.Ignore {
                 num_responses_received++
-                if reply.N_A > n_a {
+                if reply.V_A != nil && reply.N_A > n_a {
                     mutex.Lock()
                     if reply.N_A > n_a {
                         n_a = reply.N_A
-                        if n_a == InitialN_A {
-                            v_a = self_value
-                        } else {
-                            v_a = reply.V_A
-                        }
+                        v_a = reply.V_A
                     }
                     mutex.Unlock()
                 }
@@ -190,25 +213,25 @@ func (px *Paxos) Prepare(seq int, n_p int, self_value interface{}) (bool, int, i
         result = true
     }
 
-    DPrintf("[%s] Prepare returning result=%d, n_a = %d, v_a = %d\n", px.peers[px.me], result, n_a, v_a)
-    return result, n_a, v_a
+    DPrintf("[%s] Prepare returning result=%d, seq = %d, n_a = %d, v_a = %d\n", px.peers[px.me], result, seq, n_a, v_a)
+    return result, v_a
 }
 
 func (px *Paxos) UpdateAcceptorState(seq int, state *PeerState) {
-    px.acceptorStateLock.Lock()
     px.seqAcceptorStates[seq] = *state
-    px.acceptorStateLock.Unlock()
 }
 
 func (px *Paxos) PrepareHandler(arg *PrepareArg, reply *PrepareReply) error {
+    //defer px.prepareHandlerLock.Unlock()
+    //px.prepareHandlerLock.Lock()
     acceptorState, ok := px.seqAcceptorStates[arg.S]
     reply.Ignore = true
 
     if ok {
         // Is this number actually greater that existing accepted state
-        if arg.N > acceptorState.N_P {
+        if arg.N >= acceptorState.N_P {
             // update the local state
-            DPrintf("[%s] PrepareHandler: Local n_p=[%d] state.", px.peers[px.me], arg.N)
+            DPrintf("[%s] PrepareHandler: Local n_p=[%d] state. input n_p=[%d], seq=[%d]\n", px.peers[px.me], acceptorState.N_P, arg.N, arg.S)
             acceptorState.N_P = arg.N
             px.UpdateAcceptorState(arg.S, &acceptorState)
 
@@ -216,18 +239,22 @@ func (px *Paxos) PrepareHandler(arg *PrepareArg, reply *PrepareReply) error {
             reply.S = arg.S
             reply.N_A = acceptorState.N_A
             reply.V_A = acceptorState.V_A
+        } else {
+            DPrintf("[%s] PrepareHandler: Sending ignore=[%d] since input arg.n[%d] is < acceptorState.N_P=[%d]. Seq=[%d]\n", px.peers[px.me], reply.Ignore, arg.N, acceptorState.N_P, arg.S)
         }
     } else {
-        DPrintf("[%s] PrepareHandler: Initialize n_p state.\n", px.peers[px.me]) 
+        DPrintf("[%s] PrepareHandler: Initialize n_p state. seq=[%d]\n", px.peers[px.me], arg.S) 
         acceptorState := PeerState{}
         acceptorState.N_P = arg.N
-        acceptorState.N_A = InitialN_A
+        acceptorState.N_A = arg.N
         px.UpdateAcceptorState(arg.S, &acceptorState)
 
         reply.Ignore = false
         reply.S = arg.S
         reply.N_A = acceptorState.N_A
+        reply.V_A = nil
     }
+    reply.doneValue = px.doneAllPeers[px.me]
     return nil
 }
 
@@ -245,10 +272,24 @@ func (px *Paxos) Accept(seq int, n int, v interface{}) bool {
     var wg sync.WaitGroup
     for idx := range px.peers {
         server := px.peers[idx]
+        isLocal := idx == px.me
         wg.Add(1)
         go func() {
             defer wg.Done()
-            ok := call(server, "Paxos.AcceptHandler", &arg, &reply)
+            var ok bool
+            if isLocal {
+                err := px.AcceptHandler(&arg, &reply)
+                ok = err == nil
+            } else {
+                ok = call(server, "Paxos.AcceptHandler", &arg, &reply)
+            }
+
+            if ok {
+                go func () {
+                    px.HandleDoneUpdate(idx, reply.doneValue)
+                }()
+            }
+
             DPrintf("[%s] AcceptHandler returned with accepted=%d\n", px.peers[px.me], reply.Accepted)
             if ok && reply.Accepted {
                 mutex.Lock()
@@ -263,14 +304,10 @@ func (px *Paxos) Accept(seq int, n int, v interface{}) bool {
 }
 
 func (px *Paxos) AcceptHandler(arg *AcceptArg, reply *AcceptReply) error {
+    //defer px.acceptHandlerLock.Unlock()
+    //px.acceptHandlerLock.Lock()
     reply.Accepted = false
-
-    acceptorState, ok := px.seqAcceptorStates[arg.S]
-
-    if !ok {
-        acceptorState := &PeerState{}
-        acceptorState.N_P = -1
-    }
+    acceptorState := px.seqAcceptorStates[arg.S]
 
     if arg.N >= acceptorState.N_P {
         acceptorState.N_P = arg.N
@@ -279,6 +316,7 @@ func (px *Paxos) AcceptHandler(arg *AcceptArg, reply *AcceptReply) error {
         px.UpdateAcceptorState(arg.S, &acceptorState)
         reply.Accepted = true
     }
+    reply.doneValue = px.doneAllPeers[px.me]
     return nil
 }
 
@@ -290,9 +328,14 @@ func (px *Paxos) Decided(seq int, n int, v interface{}) bool {
 
     for idx := range px.peers {
         server := px.peers[idx]
+        isLocal := idx == px.me
         go func() {
             var reply DecidedReply
-            call(server, "Paxos.DecidedHandler", &decided, &reply)
+            if isLocal {
+                px.DecidedHandler(&decided, &reply)
+            } else {
+                call(server, "Paxos.DecidedHandler", &decided, &reply)                
+            }
         }()
     }
     return true
@@ -310,6 +353,10 @@ func (px *Paxos) DecidedHandler(arg *DecidedArg, reply *DecidedReply) error {
     decidedState.V = arg.V
     px.decidedStates[arg.S] = decidedState
 
+    if arg.S > px.maxSeq {
+        px.maxSeq = arg.S
+    }
+
     reply.Result = true
     return nil
 }
@@ -324,30 +371,74 @@ func (px *Paxos) DecidedHandler(arg *DecidedArg, reply *DecidedReply) error {
 func (px *Paxos) Start(seq int, v interface{}) {
   // Your code here.
     go func(seq int, v interface{}) {
+        
+        if seq < px.minSeq {
+            DPrintf("[%s] Ignoring Start request on %d, since min seq = %d", px.peers[px.me], seq, px.minSeq)
+            return
+        }
+
         proposerState, ok := px.seqProposerStates[seq]
 
         if !ok {
-            proposerState.N_P = -1
-            proposerState.N_A = -1
+            proposerState.N_P = px.GetNextProposerNumber()
         }
 
         result := false
-        n_a := -1
+        var n_a int
         var v_a interface{}
 
-        for !result {
-            result, n_a, v_a = px.Prepare(seq, proposerState.N_P, v)
+        for ;!result; proposerState.N_P = px.GetNextProposerNumber() {
+            DPrintf("[%s] Starting a proposal with number=[%d], seq=[%d]\n", px.peers[px.me], proposerState.N_P, seq)
+            result, v_a = px.Prepare(seq, proposerState.N_P, v)
+            DPrintf("[%s] Results received from Start: result=[%d], n_a=[%d], v_a=[%d]\n", px.peers[px.me], result, n_a, v_a)
         }
-
-        DPrintf("[%s] Results received from Start: result=[%d], n_a=[%d], v_a=[%d]\n", px.peers[px.me], result, n_a, v_a)
 
         // The proposal has been accepted
-        accepted := px.Accept(seq, n_a, v_a)
-        DPrintf("[%s] Received %d from Accept\n", px.peers[px.me], accepted)
-        if accepted {
-            px.Decided(seq, n_a, v_a)
+        if result {
+            accepted := px.Accept(seq, proposerState.N_P, v_a)
+            DPrintf("[%s] Received %d from Accept\n", px.peers[px.me], accepted)
+            if accepted {
+                px.Decided(seq, proposerState.N_P, v_a)
+            }
         }
     }(seq, v)
+}
+
+func (px Paxos) ScanForMinAndRemoveEntriesBelowNewMin() {
+    // Compute a new minSeq
+    new_min := math.MaxInt32
+    for _, value := range px.doneAllPeers {
+        if value < new_min {
+            new_min = value
+        }
+    }
+    new_min++; // min is min done value + 1
+    if new_min > px.minSeq {
+        DPrintf("[%s] Computed a new min value: %d", new_min)
+        px.minSeq = new_min
+        // Remove instances below this new_min
+        for key, _ := range px.decidedStates {
+            if key < px.minSeq {
+                delete(px.decidedStates, key)
+            }
+        }
+    }
+}
+
+func (px *Paxos) UpdateDoneValue(peerIndex int, doneValue int) bool {
+    changed := false
+    if px.doneAllPeers[peerIndex] < doneValue {
+        px.doneAllPeers[px.me] = doneValue
+        changed = true
+    }
+    return changed
+}
+
+func (px *Paxos) HandleDoneUpdate(peerIndex int, doneValue int) {
+    if px.UpdateDoneValue(peerIndex, doneValue) {
+        DPrintf("[%s] Updated done value of index=%d to value=%d", px.peers[px.me], peerIndex, doneValue)
+        px.ScanForMinAndRemoveEntriesBelowNewMin()
+    }
 }
 
 //
@@ -357,7 +448,7 @@ func (px *Paxos) Start(seq int, v interface{}) {
 // see the comments for Min() for more explanation.
 //
 func (px *Paxos) Done(seq int) {
-    delete(px.decidedStates, seq)
+    px.HandleDoneUpdate(px.me, seq)
 }
 
 //
@@ -367,13 +458,7 @@ func (px *Paxos) Done(seq int) {
 //
 func (px *Paxos) Max() int {
     // Your code here.
-    seq := -1
-    for decided_seq := range px.decidedStates {
-        if decided_seq > seq {
-            seq = decided_seq
-        }
-    }
-    return seq
+    return px.maxSeq
 }
 
 //
@@ -406,13 +491,7 @@ func (px *Paxos) Max() int {
 // 
 func (px *Paxos) Min() int {
   // You code here.
-    min_seq := math.MaxInt32
-    for seq := range px.decidedStates {
-        if seq < min_seq {
-            min_seq = seq
-        }
-    }
-    return min_seq
+    return px.minSeq
 }
 
 //
@@ -447,6 +526,11 @@ func (px *Paxos) Kill() {
   }
 }
 
+func (px *Paxos) GetNextProposerNumber() int {
+    px.proposerSet.last = px.proposerSet.last + len(px.peers)
+    return px.proposerSet.last
+}
+
 //
 // the application wants to create a paxos peer.
 // the ports of all the paxos peers (including this one)
@@ -459,7 +543,17 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
   px.seqProposerStates = make(map[int]PeerState)
   px.seqAcceptorStates = make(map[int]PeerState)
   px.decidedStates = make(map[int]DecidedState)
-  px.acceptorStateLock = sync.Mutex{}
+  px.prepareHandlerLock = sync.Mutex{}
+  px.acceptHandlerLock = sync.Mutex{}
+
+  px.proposerSet = ProposerNumberFactory{}
+  px.proposerSet.last = me
+  px.doneAllPeers = make([]int, len(peers))
+  for i:= range px.doneAllPeers {
+    px.doneAllPeers[i] = -1
+  }
+  px.maxSeq = 0
+  px.minSeq = 0
 
   // Your initialization code here.
 
