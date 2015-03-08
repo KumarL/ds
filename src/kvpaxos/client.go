@@ -2,6 +2,7 @@ package kvpaxos
 
 import "net/rpc"
 import "fmt"
+import "math/rand"
 
 type Clerk struct {
   servers []string
@@ -56,7 +57,13 @@ func call(srv string, rpcname string,
 //
 func (ck *Clerk) Get(key string) string {
   // You will have to modify this function.
-  return ""
+  args := GetArgs{}
+  args.Key = key
+
+  var reply GetReply
+  serverIndex := rand.Int() % len(ck.servers)
+  call(ck.servers[serverIndex], "KVPaxos.Get", &args, &reply)
+  return reply.Value
 }
 
 //
@@ -65,7 +72,17 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutExt(key string, value string, dohash bool) string {
   // You will have to modify this function.
-  return ""
+  args := PutArgs{}
+  args.Key = key
+  args.Value = value
+  args.DoHash = dohash
+
+  var reply PutReply
+
+  serverIndex := rand.Int() % len(ck.servers)
+  call(ck.servers[serverIndex], "KVPaxos.Put", &args, &reply)
+
+  return reply.PreviousValue
 }
 
 func (ck *Clerk) Put(key string, value string) {
